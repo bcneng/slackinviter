@@ -1,62 +1,43 @@
 package main
 
 import (
-	"bytes"
-	"context"
 	"expvar"
 	"flag"
-	"fmt"
 	"log"
 	"net"
 	"net/http"
 	"os"
-	"text/template"
 	"time"
 
-	"github.com/go-recaptcha/recaptcha"
+	"github.com/flexd/slackinviter/slack"
+
 	"github.com/gorilla/handlers"
 	"github.com/kelseyhightower/envconfig"
-	badge "github.com/narqo/go-badge"
-	"github.com/nlopes/slack"
 	"github.com/paulbellamy/ratecounter"
 )
 
-var indexTemplate = template.Must(template.New("index.tmpl").ParseFiles("templates/index.tmpl"))
-
 var (
-	api     *slack.Client
-	captcha *recaptcha.Recaptcha
+	inviter *slack.Inviter
 	counter *ratecounter.RateCounter
-
-	ourTeam = new(team)
 
 	m *expvar.Map
 	hitsPerMinute,
 	requests,
-	inviteErrors,
 	missingFirstName,
 	missingLastName,
 	missingEmail,
 	missingCoC,
 	successfulCaptcha,
-	failedCaptcha,
-	invalidCaptcha,
-	successfulInvites,
-	userCount,
-	activeUserCount expvar.Int
+	failedCaptcha expvar.Int
 )
 
 var c Specification
 
 // Specification is the config struct
 type Specification struct {
-	Port           string `envconfig:"PORT" required:"true"`
-	CaptchaSitekey string `required:"true"`
-	CaptchaSecret  string `required:"true"`
-	SlackToken     string `required:"true"`
-	CocUrl         string `required:"false" default:"http://coc.golangbridge.org/"`
-	EnforceHTTPS   bool
-	Debug          bool // toggles nlopes/slack client's debug flag
+	slack.InviterConfig
+	Port         string `envconfig:"PORT" required:"true"`
+	EnforceHTTPS bool
 }
 
 func init() {
@@ -79,20 +60,17 @@ func init() {
 	m = expvar.NewMap("metrics")
 	m.Set("hits_per_minute", &hitsPerMinute)
 	m.Set("requests", &requests)
-	m.Set("invite_errors", &inviteErrors)
+	m.Set("invite_errors", &slack.InviteErrors)
 	m.Set("missing_first_name", &missingFirstName)
 	m.Set("missing_last_name", &missingLastName)
 	m.Set("missing_email", &missingEmail)
 	m.Set("missing_coc", &missingCoC)
-	m.Set("failed_captcha", &failedCaptcha)
-	m.Set("invalid_captcha", &invalidCaptcha)
+	m.Set("failed_captcha", &slack.FailedCaptcha)
+	m.Set("invalid_captcha", &slack.InvalidCaptcha)
 	m.Set("successful_captcha", &successfulCaptcha)
-	m.Set("successful_invites", &successfulInvites)
-	m.Set("active_user_count", &activeUserCount)
-	m.Set("user_count", &userCount)
-
-	captcha = recaptcha.New(c.CaptchaSecret)
-	api = slack.New(c.SlackToken, slack.OptionDebug(c.Debug))
+	m.Set("successful_invites", &slack.SuccessfulInvites)
+	m.Set("active_user_count", &slack.ActiveUserCount)
+	m.Set("user_count", &slack.UserCount)
 }
 
 func handleBadge(w http.ResponseWriter, r *http.Request) {
@@ -101,21 +79,13 @@ func handleBadge(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	users := userCount.String()
-	if activeUserCount.Value() > 0 {
-		users = activeUserCount.String() + "/" + userCount.String()
-	}
-
-	var buf bytes.Buffer
-	if err := badge.Render("slack", users, "#E01563", &buf); err != nil {
-		log.Fatal(err)
-	}
-	w.Header().Set("Content-Type", "image/svg+xml; charset=utf-8")
-	buf.WriteTo(w)
+	inviter.RenderBadge(w)
 }
 
 func main() {
 	go pollSlack()
+
+	inviter = slack.NewInviter(c.InviterConfig)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/invite/", handleInvite)
 	mux.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.Dir("./static"))))
@@ -143,59 +113,10 @@ func enforceHTTPSFunc(h http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-// Updates the globals from the slack API
-// returns the length of time to sleep before the function
-// should be called again
-func updateFromSlack() time.Duration {
-	var (
-		err            error
-		p              slack.UserPagination
-		uCount, aCount int64 // users and active users
-	)
-
-	ctx := context.Background()
-	for p = api.GetUsersPaginated(
-		slack.GetUsersOptionPresence(true),
-		slack.GetUsersOptionLimit(500),
-	); !p.Done(err); p, err = p.Next(ctx) {
-		if err != nil {
-			if rle, ok := err.(*slack.RateLimitedError); ok {
-				fmt.Printf("Being Rate Limited by Slack: %s\n", rle)
-				time.Sleep(rle.RetryAfter)
-				continue
-			}
-		}
-		for _, u := range p.Users {
-			if u.ID != "USLACKBOT" && !u.IsBot && !u.Deleted {
-				uCount++
-				if u.Presence == "active" {
-					aCount++
-				}
-			}
-		}
-		fmt.Println("User Count:", uCount)
-		fmt.Println("Active Count:", aCount)
-	}
-	userCount.Set(uCount)
-	activeUserCount.Set(aCount)
-	if err != nil && !p.Done(err) {
-		log.Println("error polling slack for users:", err)
-		return time.Minute
-	}
-
-	st, err := api.GetTeamInfo()
-	if err != nil {
-		log.Println("error polling slack for team info:", err)
-		return time.Minute
-	}
-	ourTeam.Update(st)
-	return time.Hour
-}
-
 // pollSlack over and over again
 func pollSlack() {
 	for {
-		time.Sleep(updateFromSlack())
+		time.Sleep(inviter.UpdateFromSlack())
 	}
 }
 
@@ -205,31 +126,7 @@ func homepage(w http.ResponseWriter, r *http.Request) {
 	hitsPerMinute.Set(counter.Rate())
 	requests.Add(1)
 
-	var buf bytes.Buffer
-	err := indexTemplate.Execute(
-		&buf,
-		struct {
-			SiteKey,
-			UserCount,
-			ActiveCount string
-			Team   *team
-			CocUrl string
-		}{
-			c.CaptchaSitekey,
-			userCount.String(),
-			activeUserCount.String(),
-			ourTeam,
-			c.CocUrl,
-		},
-	)
-	if err != nil {
-		log.Println("error rendering template:", err)
-		http.Error(w, "error rendering template :-(", http.StatusInternalServerError)
-		return
-	}
-	// Set the header and write the buffer to the http.ResponseWriter
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	buf.WriteTo(w)
+	inviter.RenderHomepage(w)
 }
 
 // ShowPost renders a single post
@@ -271,25 +168,14 @@ func handleInvite(w http.ResponseWriter, r *http.Request) {
 	}
 
 	captchaResponse := r.FormValue("g-recaptcha-response")
-	valid, err := captcha.Verify(captchaResponse, remoteIP)
+	err = inviter.Invite(fname, lname, email, captchaResponse, remoteIP)
 	if err != nil {
-		failedCaptcha.Add(1)
-		http.Error(w, "Error validating recaptcha.. Did you click it?", http.StatusPreconditionFailed)
-		return
-	}
-	if !valid {
-		invalidCaptcha.Add(1)
-		http.Error(w, "Invalid recaptcha", http.StatusInternalServerError)
-		return
+		if err == slack.ErrValidatingCatchpta {
+			http.Error(w, err.Error(), http.StatusPreconditionFailed)
+			return
+		}
 
-	}
-	// all is well, let's try to invite someone!
-	err = api.InviteToTeam(ourTeam.Domain(), fname, lname, email)
-	if err != nil {
-		log.Println("InviteToTeam error:", err)
-		inviteErrors.Add(1)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	successfulInvites.Add(1)
 }
