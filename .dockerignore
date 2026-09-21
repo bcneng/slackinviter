@@ -1,0 +1,4 @@
+.git
+*.md
+Procfile
+app.json
